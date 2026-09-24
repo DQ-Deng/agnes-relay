@@ -26,6 +26,14 @@ timeout_seconds = 120.0
 [observability]
 # 事件日志落地路径（相对路径基于本文件所在目录）
 log_path = "logs/relay_events.log"
+# 日志滚动（日志管理）：单文件写满 log_max_mb(MB) 即轮转
+# （relay_events.log -> .1 -> .2 … .N），保留最近 log_backups 份，最旧的自动丢弃；
+# log_max_mb = 0 关闭轮转。轮转情况可在 /status 的 log 段看到。
+log_max_mb = 10
+log_backups = 5
+# 应用日志（程序自身运维日志：全局异常拦截的完整 traceback、配置告警、启动信息），
+# 与事件日志分家落地，滚动共用上面的 log_max_mb / log_backups
+app_log_path = "logs/relay_app.log"
 # 异常告警阈值（基于最近 alert_window_s 秒的滑动窗口；样本数 < alert_min_samples 时不评估速率类告警）
 alert_window_s = 120
 alert_min_samples = 20

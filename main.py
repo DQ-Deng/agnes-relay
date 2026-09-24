@@ -30,7 +30,8 @@ Agnes 双企业账号本地中转（透明转发版）
    - GET /healthz          存活/就绪探针（可服务=200，降级/故障=503）
    - GET /status           富状态（含 alerts 告警评估）
    - GET /metrics          Prometheus 指标（含 agnes_relay_health / agnes_relay_alert）
-   - 事件日志落地 logs/relay_events.log（可用 AGNES_LOG 覆盖）
+   - 事件日志落地 logs/relay_events.log（可用 AGNES_LOG 覆盖；按大小自动滚动，默认单文件 10MB、保留 5 份备份，
+      可经 observability.log_max_mb / log_backups 或 AGNES_LOG_MAX_MB / AGNES_LOG_BACKUPS 调整）
 6. 告警阈值可经环境变量微调：AGNES_ALERT_SUCCESS_RATE / _5XX_RATE / _429_RATE /
    _P95_S / _WINDOW_S / _MIN_SAMPLES（详见 CONFIG 段）。
 
@@ -46,6 +47,8 @@ from collections import deque, defaultdict
 from datetime import datetime
 import httpx
 from contextlib import asynccontextmanager
+import logging
+from logging.handlers import RotatingFileHandler
 
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse, Response
@@ -65,7 +68,8 @@ def _load_toml() -> dict:
     except FileNotFoundError:
         return {}
     except Exception as e:  # 配置损坏不应阻断启动，退回默认值
-        print(f"[warn] 读取 config.toml 失败，使用默认值: {e}")
+        # 此时 applog 尚未初始化，直接写 "agnes_relay" logger（有 handler 进文件，无则走 lastResort 到 stderr）
+        logging.getLogger("agnes_relay").warning("读取 config.toml 失败，使用默认值: %s", e)
         return {}
 
 
@@ -100,6 +104,56 @@ CLIENT_TIMEOUT = float(_cfg("limits", "timeout_seconds", "AGNES_TIMEOUT", "120")
 LOG_PATH = os.getenv("AGNES_LOG", _CONFIG.get("observability", {}).get("log_path", "logs/relay_events.log"))
 if not os.path.isabs(LOG_PATH):
     LOG_PATH = os.path.join(_HERE, LOG_PATH)
+
+# 日志管理（滚动）：单文件写满 log_max_mb(MB) 即轮转
+# （relay_events.log -> .1 -> .2 … .N，保留最近 log_backups 份，最旧的自动丢弃）；
+# log_max_mb = 0 关闭轮转。可在 config.toml[observability] 或环境变量覆盖。
+LOG_MAX_MB = float(_cfg("observability", "log_max_mb", "AGNES_LOG_MAX_MB", "10"))
+LOG_BACKUPS = int(_cfg("observability", "log_backups", "AGNES_LOG_BACKUPS", "5"))
+
+# 应用日志（程序自身运维日志：全局异常 traceback、配置告警、启动信息）：
+# 与事件日志分家落地 logs/relay_app.log（可用 AGNES_APP_LOG / observability.app_log_path 覆盖），
+# 滚动复用同一组参数 log_max_mb / log_backups。事件日志=结构化 TSV 流水（机器看），
+# 应用日志=traceback 与运维信息（人排障看）。
+APP_LOG_PATH = os.getenv("AGNES_APP_LOG", _CONFIG.get("observability", {}).get("app_log_path", "logs/relay_app.log"))
+if not os.path.isabs(APP_LOG_PATH):
+    APP_LOG_PATH = os.path.join(_HERE, APP_LOG_PATH)
+
+
+def _build_app_logger() -> logging.Logger:
+    """程序自身运维日志：文件（RotatingFileHandler 按大小滚动）+ 控制台双输出。
+    幂等：uvicorn 热重载 / 模块被重复导入时不会叠加 handler。"""
+    lg = logging.getLogger("agnes_relay")
+    if lg.handlers:
+        return lg
+    lg.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    if LOG_MAX_MB > 0:
+        try:
+            os.makedirs(os.path.dirname(APP_LOG_PATH), exist_ok=True)
+            fh = RotatingFileHandler(
+                APP_LOG_PATH,
+                maxBytes=int(LOG_MAX_MB * 1024 * 1024),
+                backupCount=LOG_BACKUPS,
+                encoding="utf-8",
+            )
+            fh.setFormatter(fmt)
+            lg.addHandler(fh)
+        except Exception:
+            pass  # 文件 handler 打不开时降级为仅控制台，不阻断启动
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    lg.addHandler(sh)
+    lg.info(
+        "app logger ready: file=%s max_mb=%s backups=%s",
+        APP_LOG_PATH,
+        f"{LOG_MAX_MB:g}" if LOG_MAX_MB > 0 else "off",
+        LOG_BACKUPS,
+    )
+    return lg
+
+
+applog = _build_app_logger()
 
 # ------------------------- 异常告警阈值 -------------------------
 # 基于最近 ALERT_WINDOW_S 秒的请求结果滑动窗口评估，超过阈值即激活告警。
@@ -204,6 +258,7 @@ class _C:
     """单个计数器（上游维度或模型维度共用）。"""
     __slots__ = ("requests", "success", "upstream_429", "upstream_5xx",
                  "http_error", "cooldown", "failover", "stream_error",
+                 "unhandled",
                  "lat_sum", "lat_n", "lat_max", "lat_deque")
 
     def __init__(self):
@@ -215,6 +270,7 @@ class _C:
         self.cooldown = 0
         self.failover = 0
         self.stream_error = 0
+        self.unhandled = 0
         self.lat_sum = 0.0
         self.lat_n = 0
         self.lat_max = 0.0
@@ -235,12 +291,18 @@ class Metrics:
         self._alert_active = set()                # 当前激活告警类型（状态翻转日志用）
         self.started = time.monotonic()
         self._logpath = LOG_PATH
+        self.log_rotations = 0   # 累计轮转次数（/status 可见）
+        self._log_max_bytes = int(LOG_MAX_MB * 1024 * 1024) if LOG_MAX_MB > 0 else 0
+        self._log_backups = max(0, int(LOG_BACKUPS))
         try:
             os.makedirs(os.path.dirname(self._logpath), exist_ok=True)
             self._logf = open(self._logpath, "a", encoding="utf-8", buffering=1)
+            self._log_size = os.path.getsize(self._logpath)  # 现有文件大小（重启续写计入）
         except Exception:
             self._logf = None
-        self.log_event("startup", "-", f"upstreams={[u.name for u in POOL]}")
+            self._log_size = 0
+        self.log_event("startup", "-", f"upstreams={[u.name for u in POOL]} "
+                      f"log_max_mb={LOG_MAX_MB if LOG_MAX_MB > 0 else 'off'} log_backups={self._log_backups}")
 
     # --- 计数接口 ---
     def client_request(self, model):
@@ -297,14 +359,64 @@ class Metrics:
         if model:
             self.per_model[model].stream_error += 1
 
+    def unhandled(self):
+        """全局异常拦截到的未处理异常计数（全局维度）。"""
+        self.global_.unhandled += 1
+
     def log_event(self, kind, up, detail=""):
         ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
         self.events.append({"ts": ts, "kind": kind, "up": up, "detail": detail[:200]})
-        if self._logf:
+        if self._logf is None:
+            return
+        line = f"{ts}\t{kind}\t{up}\t{detail[:200]}\n"
+        nbytes = len(line.encode("utf-8"))
+        try:
+            # 日志管理：写入前检查是否超限，超限先整体轮转再写，保证单文件永不越过上限
+            if self._log_max_bytes and self._log_size + nbytes > self._log_max_bytes:
+                self._rotate_log()
+                if self._logf is None:
+                    return
+            self._logf.write(line)
+            self._log_size += nbytes
+        except Exception:
+            pass
+
+    def _rotate_log(self):
+        """按大小轮转事件日志（标准 RotatingFileHandler 命名）：
+        relay_events.log -> .1 -> .2 … .N，保留最近 _log_backups 份，最旧的丢弃。
+        单事件循环内同步执行、无需锁；轮转失败时回退重开原文件，保证日志不断流。
+        _log_backups = 0 表示不保留备份，直接丢弃旧文件。"""
+        try:
+            if self._logf is not None:
+                self._logf.close()
+            if self._log_backups > 0:
+                oldest = f"{self._logpath}.{self._log_backups}"
+                if os.path.exists(oldest):
+                    os.remove(oldest)
+                for i in range(self._log_backups - 1, 0, -1):
+                    src = f"{self._logpath}.{i}"
+                    if os.path.exists(src):
+                        os.rename(src, f"{self._logpath}.{i + 1}")
+                if os.path.exists(self._logpath):
+                    os.rename(self._logpath, f"{self._logpath}.1")
+            else:
+                if os.path.exists(self._logpath):
+                    os.remove(self._logpath)
+            self._logf = open(self._logpath, "a", encoding="utf-8", buffering=1)
+            self._log_size = 0
+            self.log_rotations += 1
+            # 轮转本身也是运维事件，记入新文件（此刻 _log_size 已归零，安全）
+            self.log_event("log_rotated", "-",
+                           f"rotated to .1 (max_mb={self._log_max_bytes / 1048576:g}, "
+                           f"kept_backups={self._log_backups})")
+        except Exception:
+            # 轮转失败（磁盘满/权限等）：尽力重开原文件继续追加，宁可暂超上限也不丢日志
             try:
-                self._logf.write(f"{ts}\t{kind}\t{up}\t{detail[:200]}\n")
+                self._logf = open(self._logpath, "a", encoding="utf-8", buffering=1)
+                self._log_size = os.path.getsize(self._logpath)
             except Exception:
-                pass
+                self._logf = None
+                self._log_size = 0
 
     def note_outcome(self, ok: bool, kind: str, latency: float):
         """记录一次客户端请求的最终结果（成功/失败归类），供滑动窗口告警使用。
@@ -379,6 +491,9 @@ class Metrics:
 
 M = Metrics()
 
+# 启动信息记入应用日志（traceback 与运维信息的家）
+applog.info("relay ready: base_url=%s upstreams=%s", UPSTREAM_BASE_URL, [u.name for u in POOL])
+
 
 def _extract_model(raw: bytes):
     """从请求体尝试解析 model 名，用于按模型维度统计（解析失败返回 None）。"""
@@ -410,6 +525,7 @@ def _counter_view(c: _C) -> dict:
         "cooldown": c.cooldown,
         "failover": c.failover,
         "stream_error": c.stream_error,
+        "unhandled": c.unhandled,
         "latency_avg_s": round(avg, 3),
         "latency_max_s": round(c.lat_max, 3),
         "latency_p95_s": round(_pct(c.lat_deque, 95), 3),
@@ -544,6 +660,8 @@ async def _handle(request: Request):
     last_detail = "all upstreams rate-limited or unavailable"
     last_429 = None  # (content_type, body, retry_after) —— 记录上游真实 429 以便透传
     transport_failed = False  # 是否发生过网络层（连接/DNS/代理）失败
+    t0 = time.monotonic()  # 循环前初始化：首轮即全冷却且本地令牌耗尽时，
+    # 循环体从未执行，兜底分支仍需 t0 计算耗时（否则 UnboundLocalError）
 
     while True:
         u = await select_upstream(exclude)
@@ -667,12 +785,39 @@ async def _handle(request: Request):
     )
 
 
+# ------------------------- 全局异常拦截 -------------------------
+# 没有它，意外异常只会以 uvicorn 控制台 "Exception in ASGI application" 的形式冒出来：
+# 不落盘、无 traceback 管理、客户端拿不到统一错误响应。拦截后三层记录：
+#   1) 应用日志：完整 traceback（logs/relay_app.log，按大小滚动）
+#   2) 事件日志：一条 unhandled_error 事件（进 recent_events / 流水文件）
+#   3) 客户端：统一 JSON 500（不泄露内部细节，只给异常类型）
+# 边界说明：拦截的是「响应尚未开始」阶段的异常；流式响应中途的异常
+# 异常处理器无法再介入，由 stream_generator 的生成器内捕获负责（已实现）。
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    applog.exception("unhandled exception on %s %s", request.method, request.url.path)
+    M.unhandled()
+    M.log_event("unhandled_error", "-", f"{type(exc).__name__}: {exc}"[:200])
+    return JSONResponse(
+        status_code=500,
+        content={"error": f"relay internal error: {type(exc).__name__}"},
+    )
+
+
 @app.get("/status")
 async def status():
     """富状态：全局/每上游/每模型计数 + 最近事件流水，便于排查「某 key 被限 /
     故障转移没生效 / 延迟变高 / 某模型报错」等问题。"""
     return {
         "uptime_s": round(time.monotonic() - M.started, 1),
+        "log": {
+            "path": M._logpath,
+            "size_mb": round(M._log_size / 1048576, 3),
+            "max_mb": LOG_MAX_MB if LOG_MAX_MB > 0 else None,
+            "backups": M._log_backups,
+            "rotations": M.log_rotations,
+        },
         "global": _counter_view(M.global_),
         "upstreams": [
             {
@@ -703,6 +848,9 @@ async def metrics():
     L.append("# HELP agnes_relay_failover_total 故障转移触发次数")
     L.append("# TYPE agnes_relay_failover_total counter")
     L.append(f"agnes_relay_failover_total {g.failover}")
+    L.append("# HELP agnes_relay_unhandled_errors_total 全局拦截到的未处理异常次数")
+    L.append("# TYPE agnes_relay_unhandled_errors_total counter")
+    L.append(f"agnes_relay_unhandled_errors_total {g.unhandled}")
 
     def emit(name, help_, getter):
         L.append(f"# HELP {name} {help_}")

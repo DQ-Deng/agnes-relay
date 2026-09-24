@@ -50,6 +50,8 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 | `AGNES_TIMEOUT` | 上游请求超时（秒） |
 | `AGNES_HOST` / `AGNES_PORT` / `AGNES_LOG_LEVEL` | 监听地址、端口、日志级别 |
 | `AGNES_LOG` | 事件日志落地路径 |
+| `AGNES_APP_LOG` | 应用日志（程序自身运维日志/异常 traceback）落地路径 |
+| `AGNES_LOG_MAX_MB` / `AGNES_LOG_BACKUPS` | 日志滚动：单文件上限(MB) / 保留备份份数 |
 | `AGNES_ALERT_*` | 告警阈值，见下表 |
 
 ## 客户端接入
@@ -69,7 +71,24 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 | `GET /status` | 富状态：全局/每上游/每模型计数、最近事件流水、告警评估 |
 | `GET /metrics` | Prometheus 文本格式，含 `agnes_relay_health` / `agnes_relay_alert`，可被长期抓取 |
 
-事件日志默认落地 `logs/relay_events.log`（可用 `AGNES_LOG` 覆盖）。
+事件日志默认落地 `logs/relay_events.log`（可用 `AGNES_LOG` 覆盖）。**按大小自动滚动**：
+单文件写满 `log_max_mb`（默认 10MB）即轮转为 `.1`、`.2` …（标准轮转命名），仅保留最近
+`log_backups`（默认 5）份，最旧的自动丢弃；`log_max_mb = 0` 可关闭轮转。
+参数在 `config.toml[observability]` 或 `AGNES_LOG_MAX_MB` / `AGNES_LOG_BACKUPS` 中配置；
+每次轮转记一条 `log_rotated` 事件，累计次数与当前文件大小可在 `/status` 的 `log` 段看到。
+
+## 应用日志与全局异常拦截
+
+- 意外异常由**全局异常处理器**拦截（`/status`、`/metrics`、`/healthz` 及所有转发路径统一生效）：
+  - 完整 traceback 写入**应用日志** `logs/relay_app.log`（与事件日志共用 `log_max_mb` / `log_backups` 滚动）
+  - 事件日志记一条 `unhandled_error` 事件（进 `recent_events` 与流水文件）
+  - 客户端收到统一 JSON 500（仅含异常类型名，不泄露内部细节）
+- 没有它之前，意外异常只会以 uvicorn 控制台的 `Exception in ASGI application` 形式出现，
+  不落盘、无管理、易被忽略。
+- **边界**：流式响应**已开始**之后发生的异常，异常处理器无法再介入（响应头已发出），
+  由 `stream_generator` 的生成器内捕获负责：记 `stream_read_timeout` / `stream_http_error` 事件，
+  并在 SSE 流末尾补发结构化 error 事件，避免客户端静默断流。
+- 相关计数：`/status` 全局维度的 `unhandled`、`/metrics` 的 `agnes_relay_unhandled_errors_total`。
 
 ## 异常告警
 
@@ -105,5 +124,5 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 | `tests/cap_test2.py` | 容量/并发探针 |
 | `tests/diag3.py` | 快速连通性诊断 |
 
-> ⚠️ 这些脚本目前**硬编码了真实 key**。建议改用环境变量/`config.toml` 读取后再入版本库；
-> 已提交进历史的 key 应视为泄露，尽快轮换。
+> 脚本内不含任何密钥：直连对比用的 key 统一由 `tests/cfg.py` 从仓库根的 `config.toml`
+> 读取（该文件已被 `.gitignore` 排除）。运行前请确保 `config.toml` 已填好真实 key。
