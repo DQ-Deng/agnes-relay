@@ -1,0 +1,40 @@
+# Agnes 双企业账号本地中转 —— 示例配置
+# 使用方法：
+#   copy config.example.toml config.toml   （Windows）
+#   cp   config.example.toml config.toml   （Linux/macOS）
+# 然后填入你的真实 key，保存后重启服务即可。
+#
+# 取值优先级：环境变量 > 本文件 > 内置默认值。
+# 提示：config.toml 含密钥，请勿提交到版本库（已在 .gitignore 中排除）。
+
+[upstream]
+# 上游域名根（不带 /v1）；中继会原样转发客户端发来的完整路径（含 /v1/...）
+base_url = "https://api.agnes-ai.cn"
+# 两个**独立企业账号**的 key（必须属于两个不同账号，否则限流池共享、故障转移无意义）
+key_1 = "在这里填 key_1"
+key_2 = "在这里填 key_2"
+
+[limits]
+# 每个 key 的 RPM 上限（建议低于企业实际值留余量；企业文本实际约 40）
+rpm_1 = 35
+rpm_2 = 35
+# 单个 key 触发 429 后的冷却时长（秒），建议对齐 RPM 重置窗口
+cooldown_seconds = 60
+# 上游请求超时（秒），保留足够长以支持长流式生成
+timeout_seconds = 120.0
+
+[observability]
+# 事件日志落地路径（相对路径基于本文件所在目录）
+log_path = "logs/relay_events.log"
+# 异常告警阈值（基于最近 alert_window_s 秒的滑动窗口；样本数 < alert_min_samples 时不评估速率类告警）
+alert_window_s = 120
+alert_min_samples = 20
+alert_success_rate = 0.90   # 成功率低于此值 => critical
+alert_5xx_rate = 0.25       # 5xx 占比高于此值 => warning
+alert_429_rate = 0.40       # 429 占比高于此值 => warning（逼近限流）
+alert_p95_s = 45.0          # 窗口 p95 延迟高于此秒数 => warning
+
+[server]
+host = "0.0.0.0"
+port = 8000
+log_level = "info"

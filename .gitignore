@@ -1,0 +1,51 @@
+# ===== 密钥与本地配置（切勿提交）=====
+config.toml
+.env
+*.env
+*.local
+
+# ===== Python 字节码 / 缓存 =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ===== 打包 / 构建产物 =====
+build/
+dist/
+*.egg-info/
+*.egg
+wheels/
+.eggs/
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ===== 测试 / 覆盖率 / 类型检查缓存 =====
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+
+# ===== 运行产物 / 日志 =====
+logs/
+*.log
+
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ===== 操作系统 =====
+.DS_Store
+Thumbs.db
