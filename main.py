@@ -166,6 +166,11 @@ ALERT_429_RATE = float(_cfg("observability", "alert_429_rate", "AGNES_ALERT_429_
 ALERT_P95_S = float(_cfg("observability", "alert_p95_s", "AGNES_ALERT_P95_S", "45.0"))         # p95 延迟高于此秒数=warning
 # ------------------------------------------------------------------
 
+# 公网部署可选访问令牌（仅当设置后生效）
+# 设置后：代理转发路径与 /logs 必须携带令牌（X-Relay-Token / Authorization: Bearer /
+# ?token=），否则返回 401。留空则完全不启用（保持 localhost 默认开放）。
+RELAY_TOKEN = (_CONFIG.get("auth", {}).get("token") or os.getenv("AGNES_RELAY_TOKEN", "")) or ""
+
 
 class TokenBucket:
     """异步安全的令牌桶，用于按 RPM 主动限流。"""
@@ -640,6 +645,18 @@ def _normalize_models(raw: dict) -> dict:
     return {"object": "list", "data": data}
 
 
+def _authorized(request: Request) -> bool:
+    """公网令牌校验：未配置令牌时恒为 True（localhost 兼容）。
+    支持三种传入方式：?token= / X-Relay-Token / Authorization: Bearer。"""
+    if not RELAY_TOKEN:
+        return True
+    q = request.query_params.get("token", "")
+    h = request.headers.get("x-relay-token", "")
+    a = request.headers.get("authorization", "")
+    bearer = a.removeprefix("Bearer ").strip() if a.lower().startswith("Bearer ") else ""
+    return RELAY_TOKEN in (q, h, bearer)
+
+
 async def _handle(request: Request):
     """通用透明转发：原样转发任意方法/路径/请求体，仅做双 key 故障转移与 RPM 限流。
     请求体（含 model 名）一律不解析、不改写。唯一例外：GET /v1/models（含裸 /models
@@ -935,11 +952,35 @@ async def healthz():
     )
 
 
+@app.get("/logs")
+async def logs(request: Request, lines: int = 200, which: str = "events"):
+    """受令牌保护的日志查看端点（公网部署时用于远程检查日志）。
+    仅读取沙箱磁盘上的日志文件并尾部返回，不写入、不持久化。
+    which=events -> logs/relay_events.log；which=app -> logs/relay_app.log。"""
+    if not _authorized(request):
+        return JSONResponse(
+            status_code=401,
+            content={"error": "unauthorized: missing or invalid relay token"},
+        )
+    path = LOG_PATH if which == "events" else APP_LOG_PATH
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            data = f.read().splitlines()[-lines:]
+    except FileNotFoundError:
+        data = []
+    return Response("\n".join(data), media_type="text/plain; charset=utf-8")
+
+
 @app.api_route(
     "/{path:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
 )
 async def proxy(request: Request):
+    if not _authorized(request):
+        return JSONResponse(
+            status_code=401,
+            content={"error": "unauthorized: missing or invalid relay token"},
+        )
     return await _handle(request)
 
 
@@ -950,5 +991,7 @@ if __name__ == "__main__":
 
     _host = _cfg("server", "host", "AGNES_HOST", "0.0.0.0")
     _port = int(_cfg("server", "port", "AGNES_PORT", "8000"))
+    # 云端/容器部署：优先使用平台注入的 PORT 环境变量（本地未设置时回退到配置/8000）
+    _port = int(os.getenv("PORT", str(_port)))
     _lvl = _cfg("server", "log_level", "AGNES_LOG_LEVEL", "info")
     uvicorn.run(app, host=_host, port=_port, log_level=_lvl)
